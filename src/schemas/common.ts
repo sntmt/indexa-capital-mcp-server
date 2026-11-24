@@ -35,10 +35,28 @@ export const accountNumberSchema = z
 export const isoDateSchema = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in YYYY-MM-DD format")
+  .refine(
+    (s) => {
+      const d = new Date(`${s}T00:00:00Z`);
+      return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(s);
+    },
+    "Date is not a valid calendar date"
+  )
   .describe("Date in YYYY-MM-DD format. Example: '2024-01-15'.");
 
+/**
+ * Returns an error message if both bounds are given and date_from is
+ * after date_to, otherwise null.
+ */
+export function dateRangeError(from?: string, to?: string): string | null {
+  if (from && to && from > to) {
+    return `Error: date_from (${from}) must be on or before date_to (${to}).`;
+  }
+  return null;
+}
+
 export const responseFormatSchema = z
-  .nativeEnum(ResponseFormat)
+  .enum(ResponseFormat)
   .default(ResponseFormat.MARKDOWN)
   .describe(
     "Output format: 'markdown' for human-readable summary or 'json' for full structured data."

@@ -10,6 +10,9 @@ export const CHARACTER_LIMIT = 25000;
 /** Default request timeout in milliseconds. */
 export const REQUEST_TIMEOUT_MS = 30000;
 
+/** Maximum accepted API response body size in bytes (guards memory). */
+export const MAX_RESPONSE_BYTES = 20 * 1024 * 1024;
+
 /** Authentication header name expected by the Indexa Capital API. */
 export const AUTH_HEADER = "X-AUTH-TOKEN";
 
@@ -18,20 +21,10 @@ export enum ResponseFormat {
   JSON = "json",
 }
 
-/** Account status values returned by the API. */
-export const ACCOUNT_STATUSES = [
-  "init",
-  "awaiting",
-  "init-failed",
-  "pending-contract",
-  "pending-pbc",
-  "pending-provider",
-  "active",
-  "inactive",
-  "cancelled",
-  "cancel-request",
-  "deleted",
-] as const;
-
-/** Account product types. */
-export const ACCOUNT_TYPES = ["mutual", "pension"] as const;
+/** Annotations shared by every tool: all of them are read-only GETs. */
+export const READ_ONLY_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true,
+} as const;

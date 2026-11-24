@@ -12,10 +12,17 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { apiGet, handleApiError } from "../services/client.js";
-import { formatEur, renderOutput } from "../services/format.js";
+import { READ_ONLY_ANNOTATIONS } from "../constants.js";
+import { accountPath, apiGet } from "../services/client.js";
+import {
+  formatEur,
+  mdCell,
+  toolError,
+  toolResult,
+} from "../services/format.js";
 import {
   accountNumberSchema,
+  dateRangeError,
   isoDateSchema,
   responseFormatSchema,
 } from "../schemas/common.js";
@@ -43,13 +50,13 @@ interface FeeRecord {
 }
 
 function inDateWindow(
-  fromQuarter: string,
-  toQuarter: string,
+  fromQuarter: string | undefined,
+  toQuarter: string | undefined,
   filterFrom?: string,
   filterTo?: string
 ): boolean {
-  if (filterTo && fromQuarter > filterTo) return false;
-  if (filterFrom && toQuarter < filterFrom) return false;
+  if (filterTo && fromQuarter && fromQuarter > filterTo) return false;
+  if (filterFrom && toQuarter && toQuarter < filterFrom) return false;
   return true;
 }
 
@@ -77,15 +84,15 @@ function renderMarkdown(records: FeeRecord[]): string {
   lines.push("|---|---:|---:|---:|---:|");
   // Sort newest first
   const sorted = [...records].sort((a, b) =>
-    b.date_from.localeCompare(a.date_from)
+    (b.date_from ?? "").localeCompare(a.date_from ?? "")
   );
   for (const r of sorted) {
     const tasa =
-      r.average_fee !== undefined && r.average_fee !== null
+      typeof r.average_fee === "number"
         ? `${r.average_fee.toFixed(4)}%`
         : "—";
     lines.push(
-      `| ${r.date_from} → ${r.date_to} | ${formatEur(r.amount)} | ${formatEur(
+      `| ${mdCell(r.date_from)} → ${mdCell(r.date_to)} | ${formatEur(r.amount)} | ${formatEur(
         r.fees
       )} | ${formatEur(r.vat)} | ${tasa} |`
     );
@@ -136,18 +143,15 @@ Examples:
 Error handling:
   - 404: account not found or no fees yet (e.g. very recently opened).
   - 401/403: token invalid.`,
-      inputSchema: InputSchema.shape,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
+      inputSchema: InputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
     },
     async (params: Input) => {
+      const rangeError = dateRangeError(params.date_from, params.date_to);
+      if (rangeError) return toolError(rangeError);
       try {
         const raw = await apiGet<FeeRecord[]>(
-          `/accounts/${encodeURIComponent(params.account_number)}/fees`
+          accountPath(params.account_number, "/fees")
         );
         const all = Array.isArray(raw) ? raw : [];
         const filtered = all.filter((r) =>
@@ -159,21 +163,12 @@ Error handling:
           )
         );
 
-        const markdown = renderMarkdown(filtered);
-        const { text } = renderOutput(
-          params.response_format,
-          markdown,
-          filtered
-        );
-        return {
-          content: [{ type: "text", text }],
-          structuredContent: { fees: filtered, count: filtered.length },
-        };
+        return toolResult(params.response_format, renderMarkdown(filtered), {
+          fees: filtered,
+          count: filtered.length,
+        });
       } catch (error) {
-        return {
-          content: [{ type: "text", text: handleApiError(error) }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );

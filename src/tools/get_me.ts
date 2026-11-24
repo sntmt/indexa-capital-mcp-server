@@ -8,9 +8,14 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { ResponseFormat } from "../constants.js";
-import { apiGet, handleApiError } from "../services/client.js";
-import { renderOutput } from "../services/format.js";
+import { READ_ONLY_ANNOTATIONS } from "../constants.js";
+import { apiGet } from "../services/client.js";
+import {
+  accountTypeLabel,
+  maskSensitive,
+  toolError,
+  toolResult,
+} from "../services/format.js";
 import { responseFormatSchema } from "../schemas/common.js";
 
 const InputSchema = z
@@ -53,7 +58,36 @@ interface MeResponse {
   person?: { name?: string };
 }
 
-function renderMarkdown(data: MeResponse): string {
+/**
+ * Whitelists the fields exposed to the model and masks personal
+ * identifiers (document, phone). Internal fields such as affiliate_fee
+ * or source are dropped.
+ */
+function sanitize(data: MeResponse) {
+  return {
+    username: data.username,
+    email: data.email,
+    name: data.name,
+    surname: data.surname,
+    document: maskSensitive(data.document),
+    document_type: data.document_type,
+    phone: maskSensitive(data.phone),
+    roles: data.roles,
+    is_activated: data.is_activated,
+    email_activated: data.email_activated,
+    phone_activated: data.phone_activated,
+    accounts: (data.accounts ?? []).map((a) => ({
+      account_number: a.account_number,
+      status: a.status,
+      type: a.type,
+    })),
+    accounts_relations: data.accounts_relations ?? [],
+  };
+}
+
+type SanitizedMe = ReturnType<typeof sanitize>;
+
+function renderMarkdown(data: SanitizedMe): string {
   const lines: string[] = [];
   lines.push(`# Indexa Capital — Cuenta de usuario`);
   lines.push("");
@@ -76,7 +110,7 @@ function renderMarkdown(data: MeResponse): string {
   );
   lines.push("");
 
-  const accounts = data.accounts ?? [];
+  const accounts = data.accounts;
   if (accounts.length === 0) {
     lines.push("## Cuentas");
     lines.push("");
@@ -87,12 +121,10 @@ function renderMarkdown(data: MeResponse): string {
   lines.push(`## Cuentas (${accounts.length})`);
   lines.push("");
   for (const account of accounts) {
-    const relation = data.accounts_relations?.find(
+    const relation = data.accounts_relations.find(
       (r) => r.account_number === account.account_number
     )?.relation;
-    const typeLabel =
-      account.type === "mutual" ? "Cartera de fondos" : "Plan de pensiones";
-    lines.push(`### ${account.account_number} — ${typeLabel}`);
+    lines.push(`### ${account.account_number} — ${accountTypeLabel(account.type)}`);
     lines.push(`- **Estado**: ${account.status}`);
     if (relation) lines.push(`- **Relación**: ${relation}`);
     lines.push("");
@@ -120,8 +152,9 @@ Returns:
     "email": string,
     "name"?: string,
     "surname"?: string,
-    "document": string,
+    "document": string,                 // masked, e.g. "***45Z"
     "document_type": string,
+    "phone"?: string,                   // masked
     "roles": string[],
     "is_activated": boolean,
     "accounts": [
@@ -145,28 +178,15 @@ Examples:
 Error handling:
   - 401/403: token is invalid or revoked. Regenerate it in the Indexa
     private area at Configuración de usuario > Aplicaciones.`,
-      inputSchema: InputSchema.shape,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
+      inputSchema: InputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
     },
     async (params: Input) => {
       try {
-        const data = await apiGet<MeResponse>("/users/me");
-        const markdown = renderMarkdown(data);
-        const { text } = renderOutput(params.response_format, markdown, data);
-        return {
-          content: [{ type: "text", text }],
-          structuredContent: data as unknown as Record<string, unknown>,
-        };
+        const data = sanitize(await apiGet<MeResponse>("/users/me"));
+        return toolResult(params.response_format, renderMarkdown(data), data);
       } catch (error) {
-        return {
-          content: [{ type: "text", text: handleApiError(error) }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );

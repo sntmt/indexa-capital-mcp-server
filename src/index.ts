@@ -11,8 +11,11 @@
  * the Indexa private area at Configuración de usuario > Aplicaciones.
  */
 
+import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+
+import { getApiToken, MISSING_TOKEN_MESSAGE } from "./services/client.js";
 
 import { registerGetMe } from "./tools/get_me.js";
 import { registerGetAccount } from "./tools/get_account.js";
@@ -22,9 +25,15 @@ import { registerGetTransactions } from "./tools/get_transactions.js";
 import { registerGetFees } from "./tools/get_fees.js";
 import { registerPortfolioSummary } from "./tools/portfolio_summary.js";
 
+// Single source of truth for the version: package.json (shipped with the
+// package, one level above dist/).
+const { version } = createRequire(import.meta.url)("../package.json") as {
+  version: string;
+};
+
 const server = new McpServer({
   name: "indexa-capital-mcp-server",
-  version: "0.1.0",
+  version,
 });
 
 // Register all tools.
@@ -39,13 +48,8 @@ registerPortfolioSummary(server);
 async function main(): Promise<void> {
   // Validate the token is present before connecting transport so we
   // fail fast with a clear error in the client logs.
-  if (!process.env.INDEXA_API_TOKEN || process.env.INDEXA_API_TOKEN.trim() === "") {
-    console.error(
-      "ERROR: INDEXA_API_TOKEN environment variable is required.\n" +
-        "Generate a token in the Indexa private area at " +
-        "Configuración de usuario > Aplicaciones, then add it to the " +
-        "MCP server's env config."
-    );
+  if (!getApiToken()) {
+    console.error(`ERROR: ${MISSING_TOKEN_MESSAGE}`);
     process.exit(1);
   }
 

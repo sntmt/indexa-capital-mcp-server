@@ -9,7 +9,24 @@
  */
 
 import axios, { AxiosError, AxiosInstance } from "axios";
-import { API_BASE_URL, AUTH_HEADER, REQUEST_TIMEOUT_MS } from "../constants.js";
+import {
+  API_BASE_URL,
+  AUTH_HEADER,
+  MAX_RESPONSE_BYTES,
+  REQUEST_TIMEOUT_MS,
+} from "../constants.js";
+
+export const MISSING_TOKEN_MESSAGE =
+  "INDEXA_API_TOKEN environment variable is required. " +
+  "Generate a token in the Indexa private area at " +
+  "Configuración de usuario > Aplicaciones, then add it to the " +
+  "MCP server's env config.";
+
+/** Returns the trimmed API token, or null if it is missing/blank. */
+export function getApiToken(): string | null {
+  const token = process.env.INDEXA_API_TOKEN?.trim();
+  return token ? token : null;
+}
 
 let cachedClient: AxiosInstance | null = null;
 
@@ -20,22 +37,22 @@ let cachedClient: AxiosInstance | null = null;
 export function getApiClient(): AxiosInstance {
   if (cachedClient) return cachedClient;
 
-  const token = process.env.INDEXA_API_TOKEN;
-  if (!token || token.trim() === "") {
-    throw new Error(
-      "INDEXA_API_TOKEN environment variable is required. " +
-        "Generate a token in the Indexa private area at " +
-        "Configuración de usuario > Aplicaciones."
-    );
-  }
+  const token = getApiToken();
+  if (!token) throw new Error(MISSING_TOKEN_MESSAGE);
 
   cachedClient = axios.create({
     baseURL: API_BASE_URL,
+    // Never let a request path override the host the token is sent to.
+    allowAbsoluteUrls: false,
+    // The token travels in a custom header, which redirect handling does
+    // not strip on cross-origin hops. The API has no reason to redirect,
+    // so refuse to follow redirects rather than risk leaking the token.
+    maxRedirects: 0,
     timeout: REQUEST_TIMEOUT_MS,
+    maxContentLength: MAX_RESPONSE_BYTES,
     headers: {
       [AUTH_HEADER]: token,
       Accept: "application/json",
-      "Content-Type": "application/json",
     },
   });
 
@@ -56,6 +73,14 @@ export async function apiGet<T = unknown>(
 }
 
 /**
+ * Builds a `/accounts/{account_number}[/suffix]` path with the account
+ * number safely encoded.
+ */
+export function accountPath(accountNumber: string, suffix = ""): string {
+  return `/accounts/${encodeURIComponent(accountNumber)}${suffix}`;
+}
+
+/**
  * Converts API errors into actionable, user-facing messages.
  *
  * The Indexa API returns 401/403 for invalid tokens, 404 for missing
@@ -66,10 +91,16 @@ export function handleApiError(error: unknown): string {
     if (error.response) {
       const status = error.response.status;
       const body = error.response.data as
-        | { code?: number; message?: string }
+        | { code?: number; message?: unknown }
         | undefined;
-      const detail = body?.message ? ` (${body.message})` : "";
+      const detail =
+        typeof body?.message === "string" && body.message
+          ? ` (${body.message.slice(0, 300)})`
+          : "";
 
+      if (status >= 300 && status < 400) {
+        return `Error: Indexa API answered with an unexpected redirect (HTTP ${status}); it was not followed.`;
+      }
       switch (status) {
         case 400:
           return `Error: Bad request${detail}. Check the parameters you supplied.`;
@@ -86,17 +117,17 @@ export function handleApiError(error: unknown): string {
           return `Error: Account is locked${detail}. Contact Indexa support.`;
         case 429:
           return "Error: Rate limit exceeded. Wait before retrying.";
-        case 500:
-        case 502:
-        case 503:
-          return `Error: Indexa Capital API is temporarily unavailable (HTTP ${status}). Try again later.`;
-        default:
-          return `Error: API request failed with status ${status}${detail}.`;
       }
-    } else if (error.code === "ECONNABORTED") {
+      if (status >= 500) {
+        return `Error: Indexa Capital API is temporarily unavailable (HTTP ${status}). Try again later.`;
+      }
+      return `Error: API request failed with status ${status}${detail}.`;
+    } else if (error.code === "ECONNABORTED" || error.code === "ETIMEDOUT") {
       return "Error: Request to Indexa API timed out. Try again.";
     } else if (error.code === "ENOTFOUND" || error.code === "ECONNREFUSED") {
       return "Error: Cannot reach api.indexacapital.com. Check your network connection.";
+    } else if (error.code === "ERR_BAD_RESPONSE") {
+      return "Error: Indexa API returned an invalid or oversized response.";
     }
   }
 

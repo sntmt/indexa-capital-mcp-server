@@ -12,10 +12,17 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { apiGet, handleApiError } from "../services/client.js";
-import { formatEur, renderOutput } from "../services/format.js";
+import { READ_ONLY_ANNOTATIONS } from "../constants.js";
+import { accountPath, apiGet } from "../services/client.js";
+import {
+  formatEur,
+  mdCell,
+  toolError,
+  toolResult,
+} from "../services/format.js";
 import {
   accountNumberSchema,
+  dateRangeError,
   isoDateSchema,
   responseFormatSchema,
 } from "../schemas/common.js";
@@ -70,7 +77,7 @@ function inDateWindow(
   from?: string,
   to?: string
 ): boolean {
-  if (!txDate) return true;
+  if (typeof txDate !== "string") return !from && !to;
   const d = txDate.slice(0, 10); // strip time portion if present
   if (from && d < from) return false;
   if (to && d > to) return false;
@@ -97,14 +104,13 @@ function renderMarkdown(
   lines.push("| Fecha | Tipo | Importe | Concepto |");
   lines.push("|---|---|---:|---|");
   for (const tx of txs) {
-    const date = tx.date?.slice(0, 10) ?? "—";
-    const type = tx.type ?? "—";
+    const date = typeof tx.date === "string" ? tx.date.slice(0, 10) : undefined;
     const amt = formatEur(tx.amount);
     const desc =
       tx.description ??
       tx.instrument?.name ??
-      (tx.instrument?.identifier ? `ISIN ${tx.instrument.identifier}` : "—");
-    lines.push(`| ${date} | ${type} | ${amt} | ${desc} |`);
+      (tx.instrument?.identifier ? `ISIN ${tx.instrument.identifier}` : undefined);
+    lines.push(`| ${mdCell(date)} | ${mdCell(tx.type)} | ${amt} | ${mdCell(desc)} |`);
   }
 
   return lines.join("\n");
@@ -153,18 +159,15 @@ Error handling:
 Note: Date filtering and pagination are applied client-side after the
 API responds. For very active accounts with many years of history, narrow
 the date_from / date_to window to keep responses fast and within limits.`,
-      inputSchema: InputSchema.shape,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
+      inputSchema: InputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
     },
     async (params: Input) => {
+      const rangeError = dateRangeError(params.date_from, params.date_to);
+      if (rangeError) return toolError(rangeError);
       try {
         const raw = await apiGet<TransactionsResponse>(
-          `/accounts/${encodeURIComponent(params.account_number)}/transactions`
+          accountPath(params.account_number, "/transactions")
         );
         const all = extractTransactions(raw);
 
@@ -188,21 +191,14 @@ the date_from / date_to window to keep responses fast and within limits.`,
         };
 
         const markdown = renderMarkdown(page, total, params.offset);
-        const { text } = renderOutput(
+        return toolResult(
           params.response_format,
           markdown,
           structured,
           "Narrow the date_from / date_to window or reduce 'limit'."
         );
-        return {
-          content: [{ type: "text", text }],
-          structuredContent: structured,
-        };
       } catch (error) {
-        return {
-          content: [{ type: "text", text: handleApiError(error) }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );

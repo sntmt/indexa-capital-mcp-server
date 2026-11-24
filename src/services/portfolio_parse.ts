@@ -35,7 +35,7 @@ export interface RawPosition {
   cost_amount?: number;
   cost_price?: number;
   date?: string;
-  instrument: RawInstrument;
+  instrument?: RawInstrument;
   price?: number;
   titles?: number;
   type?: string;
@@ -101,15 +101,16 @@ export function positionUnrealizedPL(p: RawPosition): number {
  */
 export function parsePortfolio(raw: RawPortfolioResponse): ParsedPortfolio {
   // Positions: real shape nests them inside instrument_accounts[].positions
+  const nested = (raw.instrument_accounts ?? []).flatMap((ia) => ia.positions ?? []);
   const positions: RawPosition[] =
-    (raw.instrument_accounts ?? []).flatMap((ia) => ia.positions ?? []).length > 0
-      ? (raw.instrument_accounts ?? []).flatMap((ia) => ia.positions ?? [])
-      : (raw.positions ?? raw.unrealized ?? []);
+    nested.length > 0 ? nested : (raw.positions ?? raw.unrealized ?? []);
 
   // Cash: real shape has portfolio.cash_amount; fallbacks for legacy variants
   const cashAmount =
     raw.portfolio?.cash_amount ??
-    raw.cash_accounts?.[0]?.amount ??
+    (raw.cash_accounts?.length
+      ? raw.cash_accounts.reduce((s, c) => s + (c.amount ?? 0), 0)
+      : undefined) ??
     raw.instrumental_account?.amount ??
     0;
 

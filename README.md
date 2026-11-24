@@ -15,6 +15,8 @@ Implementa el subconjunto de lectura de la [API REST v1.6 de Indexa](https://ind
 | `indexa_get_fees` | `GET /accounts/{id}/fees` | Comisiones de gestión por trimestre |
 
 > **Nota de seguridad**: este servidor no implementa ningún endpoint de escritura (no puede mover dinero, abrir cuentas, ni modificar tu perfil). Si en el futuro quieres añadir aportaciones programadas o transferencias, requiere un fork explícito.
+>
+> Además, para minimizar los datos personales que llegan al modelo, los números de documento (DNI/NIE) de usuario y titulares y el teléfono se devuelven enmascarados (p. ej. `***45Z`), y el cliente HTTP no sigue redirecciones para que el token nunca se envíe a otro host.
 
 ## Requisitos
 
@@ -112,6 +114,8 @@ Reinicia Claude Desktop. Verás las 7 tools disponibles bajo el icono del enchuf
 
 ## Configuración en Claude Code
 
+> Para no dejar el token en el historial del shell, expórtalo antes (por ejemplo con `read -rs INDEXA_API_TOKEN && export INDEXA_API_TOKEN`) y usa `--env INDEXA_API_TOKEN="$INDEXA_API_TOKEN"` en lugar de pegarlo literalmente.
+
 Con paquete publicado en npm (`npx`):
 
 ```bash
@@ -152,13 +156,8 @@ Una vez conectado, puedes preguntarle a Claude cosas como:
 # Compilar
 npm run build
 
-# Test rápido del token
-INDEXA_API_TOKEN=eyJ... node -e "
-  const axios = require('axios');
-  axios.get('https://api.indexacapital.com/users/me', {
-    headers: { 'X-AUTH-TOKEN': process.env.INDEXA_API_TOKEN }
-  }).then(r => console.log(JSON.stringify(r.data, null, 2)));
-"
+# Test rápido del token (con INDEXA_API_TOKEN ya exportado)
+curl -sf -H "X-AUTH-TOKEN: $INDEXA_API_TOKEN" https://api.indexacapital.com/users/me
 
 # Inspector MCP oficial
 npx @modelcontextprotocol/inspector node dist/index.js
@@ -176,7 +175,9 @@ src/
 │   └── common.ts         # Schemas Zod compartidos
 ├── services/
 │   ├── client.ts         # Cliente Axios + manejo de errores
-│   └── format.ts         # Helpers de formato (Markdown/JSON/EUR)
+│   ├── format.ts         # Helpers de formato (Markdown/JSON/EUR) y resultados de tools
+│   ├── portfolio_parse.ts # Normalización de la respuesta de /portfolio
+│   └── returns.ts        # Cálculo de rentabilidades sobre series base 100
 └── tools/
     ├── get_me.ts
     ├── get_account.ts

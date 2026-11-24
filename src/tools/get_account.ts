@@ -10,8 +10,14 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { apiGet, handleApiError } from "../services/client.js";
-import { renderOutput } from "../services/format.js";
+import { READ_ONLY_ANNOTATIONS } from "../constants.js";
+import { accountPath, apiGet } from "../services/client.js";
+import {
+  accountTypeLabel,
+  maskSensitive,
+  toolError,
+  toolResult,
+} from "../services/format.js";
 import {
   accountNumberSchema,
   responseFormatSchema,
@@ -54,11 +60,36 @@ interface AccountResponse {
   preferences?: unknown[];
 }
 
-function renderMarkdown(data: AccountResponse): string {
+/**
+ * Whitelists the fields exposed to the model and masks the holders'
+ * identity documents (holders may include third parties, e.g. beneficiaries).
+ */
+function sanitize(data: AccountResponse) {
+  return {
+    account_number: data.account_number,
+    account_type: data.account_type,
+    type: data.type,
+    status: data.status,
+    currency: data.currency,
+    funding: data.funding,
+    size: data.size,
+    platform_code: data.platform_code,
+    profile: data.profile,
+    holders: (data.holders ?? []).map((h) => ({
+      full_name: h.full_name,
+      document: maskSensitive(h.document),
+      document_type_code: h.document_type_code,
+      type: h.type,
+      percentage: h.percentage,
+    })),
+  };
+}
+
+type SanitizedAccount = ReturnType<typeof sanitize>;
+
+function renderMarkdown(data: SanitizedAccount): string {
   const lines: string[] = [];
-  const typeLabel =
-    data.type === "mutual" ? "Cartera de fondos" : "Plan de pensiones";
-  lines.push(`# Cuenta ${data.account_number} — ${typeLabel}`);
+  lines.push(`# Cuenta ${data.account_number} — ${accountTypeLabel(data.type)}`);
   lines.push("");
   lines.push(`- **Estado**: ${data.status}`);
   lines.push(`- **Tipo de titularidad**: ${data.account_type ?? "—"}`);
@@ -91,7 +122,7 @@ function renderMarkdown(data: AccountResponse): string {
     lines.push("");
   }
 
-  const holders = data.holders ?? [];
+  const holders = data.holders;
   if (holders.length > 0) {
     lines.push(`## Titulares (${holders.length})`);
     lines.push("");
@@ -139,7 +170,7 @@ Returns:
       "is_outdated": boolean,
       "needs_to_be_updated": boolean
     },
-    "holders": [...],                      // titulares con nombre y DNI
+    "holders": [...],                      // titulares con nombre y DNI enmascarado
     "platform_code": string
   }
 
@@ -152,30 +183,17 @@ Examples:
 Error handling:
   - 404: account_number does not exist or you don't have access to it.
   - 401/403: token invalid or revoked.`,
-      inputSchema: InputSchema.shape,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
+      inputSchema: InputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
     },
     async (params: Input) => {
       try {
-        const data = await apiGet<AccountResponse>(
-          `/accounts/${encodeURIComponent(params.account_number)}`
+        const data = sanitize(
+          await apiGet<AccountResponse>(accountPath(params.account_number))
         );
-        const markdown = renderMarkdown(data);
-        const { text } = renderOutput(params.response_format, markdown, data);
-        return {
-          content: [{ type: "text", text }],
-          structuredContent: data as unknown as Record<string, unknown>,
-        };
+        return toolResult(params.response_format, renderMarkdown(data), data);
       } catch (error) {
-        return {
-          content: [{ type: "text", text: handleApiError(error) }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );

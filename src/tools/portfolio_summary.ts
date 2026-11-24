@@ -7,12 +7,21 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { apiGet, handleApiError } from "../services/client.js";
-import { formatEur, formatPercent, renderOutput } from "../services/format.js";
+import { READ_ONLY_ANNOTATIONS } from "../constants.js";
+import { accountPath, apiGet, handleApiError } from "../services/client.js";
+import {
+  accountTypeLabel,
+  formatEur,
+  formatPercent,
+  signPrefix,
+  toolError,
+  toolResult,
+} from "../services/format.js";
 import {
   parsePortfolio,
   type RawPortfolioResponse,
 } from "../services/portfolio_parse.js";
+import { cumulativeReturn } from "../services/returns.js";
 import { responseFormatSchema } from "../schemas/common.js";
 
 const InputSchema = z.object({ response_format: responseFormatSchema }).strict();
@@ -37,14 +46,6 @@ interface AccountSummary {
   error?: string;
 }
 
-function cumulativeReturn(values: number[] | undefined): number | null {
-  if (!values || values.length < 2) return null;
-  const first = values[0];
-  const last = values[values.length - 1];
-  if (!first) return null;
-  return last / first - 1;
-}
-
 async function summariseAccount(account: MeAccount): Promise<AccountSummary> {
   const summary: AccountSummary = {
     account_number: account.account_number,
@@ -59,32 +60,38 @@ async function summariseAccount(account: MeAccount): Promise<AccountSummary> {
 
   if (account.status !== "active") return summary;
 
-  try {
-    const [rawPortfolio, perf] = await Promise.all([
-      apiGet<RawPortfolioResponse>(
-        `/accounts/${encodeURIComponent(account.account_number)}/portfolio`
-      ).catch(() => null),
-      apiGet<PerformanceStub>(
-        `/accounts/${encodeURIComponent(account.account_number)}/performance`
-      ).catch(() => null),
-    ]);
+  const [portfolioRes, perfRes] = await Promise.allSettled([
+    apiGet<RawPortfolioResponse>(accountPath(account.account_number, "/portfolio")),
+    apiGet<PerformanceStub>(accountPath(account.account_number, "/performance")),
+  ]);
 
-    if (rawPortfolio) {
-      const parsed = parsePortfolio(rawPortfolio);
-      summary.total_value = parsed.totalAmount;
-      summary.cash = parsed.cashAmount;
-      summary.unrealized_pl = parsed.unrealizedPL;
-    }
-
-    if (perf?.performance) {
-      summary.cumulative_return = cumulativeReturn(perf.performance.return);
-      summary.plan_expected_return = perf.plan_expected_return ?? null;
-    }
-  } catch (err) {
-    summary.error = err instanceof Error ? err.message : String(err);
+  // The portfolio is required (it feeds the totals); performance is
+  // optional, but its failure is still reported instead of swallowed.
+  const errors: string[] = [];
+  if (portfolioRes.status === "fulfilled") {
+    const parsed = parsePortfolio(portfolioRes.value);
+    summary.total_value = parsed.totalAmount;
+    summary.cash = parsed.cashAmount;
+    summary.unrealized_pl = parsed.unrealizedPL;
+  } else {
+    errors.push(`portfolio: ${handleApiError(portfolioRes.reason)}`);
   }
 
+  if (perfRes.status === "fulfilled") {
+    const perf = perfRes.value;
+    summary.cumulative_return = cumulativeReturn(perf?.performance?.return);
+    summary.plan_expected_return = perf?.plan_expected_return ?? null;
+  } else {
+    errors.push(`performance: ${handleApiError(perfRes.reason)}`);
+  }
+
+  if (errors.length > 0) summary.error = errors.join(" | ");
   return summary;
+}
+
+/** Active accounts whose portfolio could not be fetched (missing from totals). */
+function incompleteAccounts(summaries: AccountSummary[]): AccountSummary[] {
+  return summaries.filter((a) => a.status === "active" && a.total_value === null);
 }
 
 function renderMarkdown(user: MePartial, summaries: AccountSummary[]): string {
@@ -100,30 +107,37 @@ function renderMarkdown(user: MePartial, summaries: AccountSummary[]): string {
 
   const totalValue = summaries.reduce((s, a) => s + (a.total_value ?? 0), 0);
   const totalPL = summaries.reduce((s, a) => s + (a.unrealized_pl ?? 0), 0);
-  const sign = totalPL >= 0 ? "+" : "";
   lines.push(`- **Patrimonio total en Indexa**: ${formatEur(totalValue)}`);
-  lines.push(`- **P/L latente total**: ${sign}${formatEur(totalPL)}`);
+  lines.push(`- **P/L latente total**: ${signPrefix(totalPL)}${formatEur(totalPL)}`);
   lines.push(`- **Cuentas**: ${summaries.length}`);
+  const incomplete = incompleteAccounts(summaries);
+  if (incomplete.length > 0) {
+    lines.push(
+      `- ⚠️ **Totales incompletos**: no se pudo obtener la cartera de ${incomplete
+        .map((a) => a.account_number)
+        .join(", ")}.`
+    );
+  }
   lines.push("");
 
   for (const a of summaries) {
-    const label = a.type === "mutual" ? "Cartera de fondos" : "Plan de pensiones";
-    lines.push(`## ${a.account_number} — ${label}`);
+    lines.push(`## ${a.account_number} — ${accountTypeLabel(a.type)}`);
     lines.push(`- **Estado**: ${a.status}`);
     if (a.status !== "active") {
       lines.push(`- _Sin datos de cartera (cuenta no activa)._`);
       lines.push("");
       continue;
     }
-    if (a.error) {
-      lines.push(`- ⚠️ Error: ${a.error}`);
+    if (a.error) lines.push(`- ⚠️ ${a.error}`);
+    if (a.total_value === null) {
       lines.push("");
       continue;
     }
     lines.push(`- **Valor total**: ${formatEur(a.total_value)}`);
     if (a.cash !== null && a.cash > 0) lines.push(`- **Efectivo**: ${formatEur(a.cash)}`);
-    const plSign = (a.unrealized_pl ?? 0) >= 0 ? "+" : "";
-    lines.push(`- **P/L latente**: ${plSign}${formatEur(a.unrealized_pl)}`);
+    lines.push(
+      `- **P/L latente**: ${signPrefix(a.unrealized_pl ?? 0)}${formatEur(a.unrealized_pl)}`
+    );
     if (a.cumulative_return !== null) {
       lines.push(`- **Rentabilidad acumulada**: ${formatPercent(a.cumulative_return)}`);
     }
@@ -154,14 +168,10 @@ Returns JSON:
   { "user": { email, name, surname },
     "accounts": [{ account_number, type, status, total_value, cash,
                    unrealized_pl, cumulative_return, plan_expected_return, error? }],
-    "totals": { total_value, unrealized_pl, account_count } }`,
-      inputSchema: InputSchema.shape,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
+    "totals": { total_value, unrealized_pl, account_count,
+                incomplete_accounts: string[] } }   // active accounts missing from totals`,
+      inputSchema: InputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
     },
     async (params: Input) => {
       try {
@@ -173,6 +183,9 @@ Returns JSON:
           total_value: summaries.reduce((s, a) => s + (a.total_value ?? 0), 0),
           unrealized_pl: summaries.reduce((s, a) => s + (a.unrealized_pl ?? 0), 0),
           account_count: summaries.length,
+          incomplete_accounts: incompleteAccounts(summaries).map(
+            (a) => a.account_number
+          ),
         };
         const structured = {
           user: { email: me.email, name: me.name, surname: me.surname },
@@ -180,17 +193,13 @@ Returns JSON:
           totals,
         };
 
-        const markdown = renderMarkdown(me, summaries);
-        const { text } = renderOutput(params.response_format, markdown, structured);
-        return {
-          content: [{ type: "text", text }],
-          structuredContent: structured,
-        };
+        return toolResult(
+          params.response_format,
+          renderMarkdown(me, summaries),
+          structured
+        );
       } catch (error) {
-        return {
-          content: [{ type: "text", text: handleApiError(error) }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );

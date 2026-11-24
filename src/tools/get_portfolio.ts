@@ -8,11 +8,18 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { apiGet, handleApiError } from "../services/client.js";
-import { formatEur, renderOutput } from "../services/format.js";
+import { READ_ONLY_ANNOTATIONS } from "../constants.js";
+import { accountPath, apiGet } from "../services/client.js";
+import {
+  formatEur,
+  signPrefix,
+  toolError,
+  toolResult,
+} from "../services/format.js";
 import {
   parsePortfolio,
   positionUnrealizedPL,
+  type ParsedPortfolio,
   type RawPortfolioResponse,
   type RawPosition,
 } from "../services/portfolio_parse.js";
@@ -32,11 +39,10 @@ type Input = z.infer<typeof InputSchema>;
 
 function renderPosition(p: RawPosition): string[] {
   const lines: string[] = [];
-  const isin = p.instrument.identifier ?? p.instrument.isin_code ?? "—";
-  const name = p.instrument.name ?? "(sin nombre)";
-  const mgmt = p.instrument.management_company_description;
+  const isin = p.instrument?.identifier ?? p.instrument?.isin_code ?? "—";
+  const name = p.instrument?.name ?? "(sin nombre)";
+  const mgmt = p.instrument?.management_company_description;
   const pl = positionUnrealizedPL(p);
-  const sign = pl >= 0 ? "+" : "";
   const cost = p.cost_amount ?? 0;
   const amount = p.amount ?? 0;
 
@@ -47,20 +53,18 @@ function renderPosition(p: RawPosition): string[] {
     `- **Valor actual**: ${formatEur(amount)} (${p.titles ?? "—"} títulos a ${formatEur(p.price)})`
   );
   lines.push(`- **Coste**: ${formatEur(cost)}`);
-  lines.push(`- **P/L latente**: ${sign}${formatEur(pl)}`);
+  lines.push(`- **P/L latente**: ${signPrefix(pl)}${formatEur(pl)}`);
   if (cost > 0) {
     const pct = ((amount - cost) / cost) * 100;
-    lines.push(
-      `- **Rentab. sobre coste**: ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`
-    );
+    lines.push(`- **Rentab. sobre coste**: ${signPrefix(pct)}${pct.toFixed(2)}%`);
   }
   lines.push("");
   return lines;
 }
 
-function renderMarkdown(raw: RawPortfolioResponse): string {
+function renderMarkdown(parsed: ParsedPortfolio): string {
   const { totalAmount, cashAmount, instrumentsAmount, instrumentsCost, date, positions, unrealizedPL } =
-    parsePortfolio(raw);
+    parsed;
 
   const lines: string[] = [];
   lines.push(`# Cartera`);
@@ -70,12 +74,9 @@ function renderMarkdown(raw: RawPortfolioResponse): string {
   if (cashAmount > 0) lines.push(`- **Efectivo**: ${formatEur(cashAmount)}`);
   if (instrumentsCost > 0) {
     lines.push(`- **Coste total**: ${formatEur(instrumentsCost)}`);
-    const sign = unrealizedPL >= 0 ? "+" : "";
-    lines.push(`- **P/L latente total**: ${sign}${formatEur(unrealizedPL)}`);
+    lines.push(`- **P/L latente total**: ${signPrefix(unrealizedPL)}${formatEur(unrealizedPL)}`);
     const pct = ((instrumentsAmount - instrumentsCost) / instrumentsCost) * 100;
-    lines.push(
-      `- **Rentab. sobre coste**: ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`
-    );
+    lines.push(`- **Rentab. sobre coste**: ${signPrefix(pct)}${pct.toFixed(2)}%`);
   }
   if (date) lines.push(`- **Datos a fecha**: ${date}`);
   lines.push("");
@@ -88,8 +89,8 @@ function renderMarkdown(raw: RawPortfolioResponse): string {
   const byClass = new Map<string, { amount: number; cost: number }>();
   for (const p of positions) {
     const key =
-      p.instrument.asset_class_description ??
-      p.instrument.asset_class ??
+      p.instrument?.asset_class_description ??
+      p.instrument?.asset_class ??
       "unknown";
     const agg = byClass.get(key) ?? { amount: 0, cost: 0 };
     agg.amount += p.amount ?? 0;
@@ -108,9 +109,8 @@ function renderMarkdown(raw: RawPortfolioResponse): string {
         ? ((agg.amount / instrumentsAmount) * 100).toFixed(1)
         : "—";
     const pl = agg.amount - agg.cost;
-    const clsSign = pl >= 0 ? "+" : "";
     lines.push(
-      `- **${cls}**: ${formatEur(agg.amount)} (${pct}%) — P/L: ${clsSign}${formatEur(pl)}`
+      `- **${cls}**: ${formatEur(agg.amount)} (${pct}%) — P/L: ${signPrefix(pl)}${formatEur(pl)}`
     );
   }
   lines.push("");
@@ -155,21 +155,15 @@ Examples:
   - Use when: "How much am I up/down on my Indexa account?"
   - Don't use for: historical returns → indexa_get_performance
   - Don't use for: transaction history → indexa_get_transactions`,
-      inputSchema: InputSchema.shape,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
+      inputSchema: InputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
     },
     async (params: Input) => {
       try {
         const raw = await apiGet<RawPortfolioResponse>(
-          `/accounts/${encodeURIComponent(params.account_number)}/portfolio`
+          accountPath(params.account_number, "/portfolio")
         );
         const parsed = parsePortfolio(raw);
-        const markdown = renderMarkdown(raw);
         const structured = {
           total_amount: parsed.totalAmount,
           cash_amount: parsed.cashAmount,
@@ -180,16 +174,13 @@ Examples:
           position_count: parsed.positions.length,
           positions: parsed.positions,
         };
-        const { text } = renderOutput(params.response_format, markdown, structured);
-        return {
-          content: [{ type: "text", text }],
-          structuredContent: structured,
-        };
+        return toolResult(
+          params.response_format,
+          renderMarkdown(parsed),
+          structured
+        );
       } catch (error) {
-        return {
-          content: [{ type: "text", text: handleApiError(error) }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );

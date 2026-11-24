@@ -13,13 +13,18 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { apiGet, handleApiError } from "../services/client.js";
+import { READ_ONLY_ANNOTATIONS } from "../constants.js";
+import { accountPath, apiGet } from "../services/client.js";
 import {
   formatPercent,
-  renderOutput,
+  signPrefix,
+  toolError,
+  toolResult,
 } from "../services/format.js";
+import { cumulativeReturn } from "../services/returns.js";
 import {
   accountNumberSchema,
+  dateRangeError,
   isoDateSchema,
   responseFormatSchema,
 } from "../schemas/common.js";
@@ -103,6 +108,8 @@ function sliceByDate(
     if (startIdx === -1) startIdx = perf.period.length;
   }
   if (to) {
+    // If no point is on or before `to`, the window is empty.
+    endIdx = -1;
     for (let i = perf.period.length - 1; i >= 0; i--) {
       if (toCalendarDate(perf.period[i]) <= to) {
         endIdx = i;
@@ -130,18 +137,6 @@ function sliceByDate(
       expected: slice(perf.expected),
     },
   };
-}
-
-/**
- * Computes cumulative return from base-100 values.
- * 100 * (last/first - 1).
- */
-function cumulativeReturn(values: number[]): number | null {
-  if (values.length < 2) return null;
-  const first = values[0];
-  const last = values[values.length - 1];
-  if (!first || first === 0) return null;
-  return last / first - 1;
 }
 
 /**
@@ -201,8 +196,7 @@ function renderMarkdown(data: PerformanceResponse): string {
       lines.push(`- **Benchmark acumulado**: ${formatPercent(benchCum)}`);
       if (cum !== null) {
         const diff = cum - benchCum;
-        const sign = diff >= 0 ? "+" : "";
-        lines.push(`- **Alpha vs benchmark**: ${sign}${formatPercent(diff)}`);
+        lines.push(`- **Alpha vs benchmark**: ${signPrefix(diff)}${formatPercent(diff)}`);
       }
     }
   }
@@ -227,7 +221,7 @@ function renderMarkdown(data: PerformanceResponse): string {
     const last = period.length - 1;
     const v = returnSeries[last];
     const pct = base ? v / base - 1 : 0;
-    lines.push(`| ${toCalendarDate(period[last])} | ${v?.toFixed(2)} | ${formatPercent(pct)} |`);
+    lines.push(`| ${toCalendarDate(period[last])} | ${v?.toFixed(2) ?? "—"} | ${formatPercent(pct)} |`);
   }
   lines.push("");
   lines.push(
@@ -284,18 +278,15 @@ Examples:
 Error handling:
   - 404: account not found or no performance data yet (e.g. just opened).
   - 401/403: token invalid.`,
-      inputSchema: InputSchema.shape,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
+      inputSchema: InputSchema,
+      annotations: READ_ONLY_ANNOTATIONS,
     },
     async (params: Input) => {
+      const rangeError = dateRangeError(params.date_from, params.date_to);
+      if (rangeError) return toolError(rangeError);
       try {
         const raw = await apiGet<PerformanceResponse>(
-          `/accounts/${encodeURIComponent(params.account_number)}/performance`
+          accountPath(params.account_number, "/performance")
         );
 
         // Apply client-side date filtering since the API may not support
@@ -304,30 +295,19 @@ Error handling:
 
         // Optionally strip projection arrays to keep output compact.
         if (!params.include_projections && filtered.performance) {
-          const { best, worst, expected, ...rest } = filtered.performance;
-          // intentionally drop best/worst/expected
-          void best;
-          void worst;
-          void expected;
+          const { best: _best, worst: _worst, expected: _expected, ...rest } =
+            filtered.performance;
           filtered = { ...filtered, performance: rest };
         }
 
-        const markdown = renderMarkdown(filtered);
-        const { text } = renderOutput(
+        return toolResult(
           params.response_format,
-          markdown,
+          renderMarkdown(filtered),
           filtered,
           "Use date_from and date_to to narrow the time range, or omit projections."
         );
-        return {
-          content: [{ type: "text", text }],
-          structuredContent: filtered as Record<string, unknown>,
-        };
       } catch (error) {
-        return {
-          content: [{ type: "text", text: handleApiError(error) }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );
