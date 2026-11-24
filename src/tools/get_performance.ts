@@ -16,6 +16,7 @@ import { z } from "zod";
 import { READ_ONLY_ANNOTATIONS } from "../constants.js";
 import { accountPath, apiGet } from "../services/client.js";
 import {
+  formatEur,
   formatPercent,
   signPrefix,
   toolError,
@@ -49,6 +50,15 @@ const InputSchema = z
         "Include best/worst/expected projection arrays in the JSON output. " +
           "These can be very large; default false to keep responses small."
       ),
+    include_daily: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Keep the daily series (index, total_amounts, net_amounts, cash_returns, " +
+          "portfolios...). By default they are reduced to one point per month " +
+          "(levels at month-end, daily flows summed), which keeps the response " +
+          "within limits."
+      ),
     response_format: responseFormatSchema,
   })
   .strict();
@@ -62,6 +72,7 @@ interface PerformanceResponse {
   plan_expected_return?: number;
   performance?: {
     period?: string[];
+    real?: number[];
     return?: number[];
     benchmark?: number[];
     best?: number[];
@@ -92,8 +103,9 @@ function toCalendarDate(isoString: string): string {
 }
 
 /**
- * Filters parallel arrays to a date window. The arrays must all be the
- * same length as `period`.
+ * Filters the arrays in `performance` to a date window. Every array is
+ * aligned with `period` from its first element; some are shorter (the
+ * actual series `real` stops today while projections run 10 years on).
  */
 function sliceByDate(
   data: PerformanceResponse,
@@ -125,21 +137,127 @@ function sliceByDate(
     return data;
   }
 
-  const slice = <T>(arr: T[] | undefined): T[] | undefined =>
-    arr ? arr.slice(startIdx, endIdx + 1) : undefined;
-
   return {
     ...data,
-    performance: {
-      ...perf,
-      period: slice(perf.period) ?? [],
-      return: slice(perf.return),
-      benchmark: slice(perf.benchmark),
-      best: slice(perf.best),
-      worst: slice(perf.worst),
-      expected: slice(perf.expected),
-    },
+    performance: Object.fromEntries(
+      Object.entries(perf).map(([key, value]) => [
+        key,
+        Array.isArray(value) ? value.slice(startIdx, endIdx + 1) : value,
+      ])
+    ),
   };
+}
+
+/** Daily series in `return` are keyed by "YYYYMMDD". */
+function isDailySeries(value: unknown): value is Record<string, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length > 0 && keys.every((k) => /^\d{8}$/.test(k));
+}
+
+/** Daily series that hold per-day flows (P/L), not levels: summed. */
+const FLOW_SERIES = new Set(["cash_returns"]);
+
+/** Per-day flow fields inside each `portfolios` entry: summed. */
+const PORTFOLIO_FLOW_FIELDS = ["inflows", "outflows", "tax_outflows"];
+
+/**
+ * Reduces a "YYYYMMDD"-keyed daily series to one point per month, keyed
+ * by the month's last day present (so the latest point is always kept).
+ * Levels keep that day's value; flows are summed over the month.
+ */
+function toMonthly(
+  series: Record<string, number>,
+  isFlow: boolean,
+  from?: string,
+  to?: string
+): Record<string, number> {
+  const fromKey = from?.replace(/-/g, "");
+  const toKey = to?.replace(/-/g, "");
+  const months = new Map<string, { day: string; value: number }>();
+  for (const day of Object.keys(series).sort()) {
+    if (fromKey && day < fromKey) continue;
+    if (toKey && day > toKey) continue;
+    const value = series[day];
+    const prev = months.get(day.slice(0, 6));
+    months.set(day.slice(0, 6), {
+      day,
+      value:
+        isFlow && prev ? prev.value + (value ?? 0) : value,
+    });
+  }
+  return Object.fromEntries(
+    [...months.values()].map(({ day, value }) => [
+      day,
+      isFlow ? Math.round(value * 100) / 100 : value,
+    ])
+  );
+}
+
+/**
+ * `portfolios` is a daily list of account snapshots (newest first). Keep
+ * each month's last snapshot, with that month's flows summed into it.
+ */
+function portfoliosToMonthly(
+  list: Record<string, unknown>[],
+  from?: string,
+  to?: string
+): Record<string, unknown>[] {
+  const months = new Map<string, Record<string, unknown>>();
+  const sorted = [...list].sort((a, b) =>
+    String(a.date ?? "").localeCompare(String(b.date ?? ""))
+  );
+  for (const snap of sorted) {
+    const day = typeof snap.date === "string" ? snap.date.slice(0, 10) : "";
+    if (!day || (from && day < from) || (to && day > to)) continue;
+    const prev = months.get(day.slice(0, 7));
+    const merged: Record<string, unknown> = { ...snap };
+    for (const field of PORTFOLIO_FLOW_FIELDS) {
+      const sum =
+        (typeof prev?.[field] === "number" ? (prev[field] as number) : 0) +
+        (typeof snap[field] === "number" ? (snap[field] as number) : 0);
+      merged[field] = Math.round(sum * 100) / 100;
+    }
+    months.set(day.slice(0, 7), merged);
+  }
+  return [...months.values()].reverse(); // newest first, as the API
+}
+
+/**
+ * The response carries daily series (index, total_amounts, net_amounts,
+ * cash_returns, portfolios...) that exceed the response limit after a
+ * few months. Reduce them to monthly points unless the caller asks for
+ * daily data.
+ */
+function compactDailySeries(
+  data: PerformanceResponse,
+  daily: boolean,
+  from?: string,
+  to?: string
+): PerformanceResponse {
+  if (daily) return data;
+  const compact = (obj: Record<string, unknown>) =>
+    Object.fromEntries(
+      Object.entries(obj).map(([key, value]) => [
+        key,
+        isDailySeries(value)
+          ? toMonthly(value, FLOW_SERIES.has(key), from, to)
+          : value,
+      ])
+    );
+
+  const result: PerformanceResponse = compact(data);
+  if (result.return && typeof result.return === "object") {
+    result.return = compact(result.return as Record<string, unknown>);
+  }
+  if (Array.isArray(result.portfolios)) {
+    result.portfolios = portfoliosToMonthly(
+      result.portfolios as Record<string, unknown>[],
+      from,
+      to
+    );
+  }
+  return result;
 }
 
 /**
@@ -168,12 +286,16 @@ function renderMarkdown(data: PerformanceResponse): string {
   lines.push("");
 
   const perf = data.performance;
-  if (!perf?.period || perf.period.length === 0 || !perf.return) {
+  // The API calls the actual series `real`; `return` is kept as fallback.
+  const returnSeries = perf?.real ?? perf?.return;
+  if (!perf?.period || perf.period.length === 0 || !returnSeries?.length) {
     lines.push("_No hay datos de rentabilidad disponibles._");
     return lines.join("\n");
   }
 
-  const { period, return: returnSeries, benchmark } = perf;
+  // `period` also covers the 10-year projection; keep the actual part.
+  const period = perf.period.slice(0, returnSeries.length);
+  const { benchmark } = perf;
   const startDate = toCalendarDate(period[0]);
   const endDate = toCalendarDate(period[period.length - 1]);
   const cum = cumulativeReturn(returnSeries);
@@ -184,6 +306,15 @@ function renderMarkdown(data: PerformanceResponse): string {
   lines.push(`- **Rentabilidad acumulada**: ${formatPercent(cum)}`);
   if (annual !== null) {
     lines.push(`- **Rentabilidad anualizada (estimada)**: ${formatPercent(annual)}`);
+  }
+  const ret = data.return as Record<string, unknown> | undefined;
+  if (typeof ret?.money_return === "number") {
+    lines.push(
+      `- **Rentabilidad ponderada por dinero** (desde el inicio): ${formatPercent(ret.money_return)}`
+    );
+  }
+  if (typeof ret?.pl === "number") {
+    lines.push(`- **Ganancia/pérdida**: ${formatEur(ret.pl)}`);
   }
   if (data.plan_expected_return !== undefined) {
     lines.push(
@@ -248,27 +379,42 @@ Args:
   - date_from (string, optional): Filter the series to start on or after this date (YYYY-MM-DD)
   - date_to (string, optional): Filter the series to end on or before this date (YYYY-MM-DD)
   - include_projections (boolean, default false): Whether to include best/worst/expected forward projections in the JSON output. These can be large; leave off unless explicitly needed.
+  - include_daily (boolean, default false): Keep the daily series instead of monthly points (levels at month-end, flows such as cash_returns summed per month).
   - response_format ('markdown' | 'json'): Output format (default: 'markdown')
 
 The Markdown format computes and displays:
-  - Cumulative return over the period
+  - Cumulative (time-weighted) return over the period
   - Annualised return (estimated from the date range)
+  - Money-weighted return and P/L since inception
   - Plan expected return (Indexa's own projection)
-  - Benchmark comparison and alpha (if benchmark series is present)
   - A sampled subset of the curve as a table (~8 points)
 
 Returns:
   For JSON format, the structure is:
   {
-    "plan_expected_return": number,         // e.g. 0.0384 = +3.84%/year expected
+    "plan_expected_return": number,         // e.g. 0.042 = +4.2%/year expected
     "performance": {
-      "period": ["YYYY-MM-DD", ...],        // dates
-      "return": [number, ...],              // base-100 actual return series
-      "benchmark"?: [number, ...],          // base-100 benchmark series
-      "best"?: [number, ...],               // best-case projection (if requested)
-      "worst"?: [number, ...],              // worst-case projection
-      "expected"?: [number, ...]            // expected projection
-    }
+      "period": ["YYYY-MM-DD...", ...],     // month-ends, actual + 10-year projection
+      "real": [number, ...],                // base-100 actual series (aligned with
+                                            // period from the start, shorter)
+      "expected_return"?, "worst_return"?, "best_return"?: [number, ...],
+      "expected_pl"?, "worst_pl"?, "best_pl"?: [number, ...]
+                                            // projections, only with include_projections
+    },
+    "return": {
+      "time_return": number,                // time-weighted, since inception
+      "money_return": number,               // money-weighted, since inception
+      "money_return_annual", "XIRR", "pl", "investment", "inflows", "outflows": number,
+      "index", "total_amounts", "net_amounts", "cash_returns": { "YYYYMMDD": number }
+                                            // monthly unless include_daily
+    },
+    "portfolios": [{ "date", "total_amount", "cash_amount", "instruments_amount",
+                     "instruments_cost", "inflows", "outflows", ... }],
+                                            // one snapshot per month, newest first
+    "volatility", "sharpe_ratio": number,
+    "drawdowns": { "max_drawdown", "max_drawdown_EUR", ... },
+    "history": { "YYYY-MM-DD": number },    // month-end index (1 = start)
+    "benchmark": { "YYYY-MM-DD": {...} }
   }
 
 Examples:
@@ -295,6 +441,12 @@ Error handling:
         // Apply client-side date filtering since the API may not support
         // server-side filtering on this endpoint.
         let filtered = sliceByDate(raw, params.date_from, params.date_to);
+        filtered = compactDailySeries(
+          filtered,
+          params.include_daily,
+          params.date_from,
+          params.date_to
+        );
 
         // Optionally strip projection arrays to keep output compact. The
         // API names them best_return, worst_pl, expected_return, etc.

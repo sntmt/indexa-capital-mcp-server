@@ -109,8 +109,8 @@ export function renderOutput(
 
 /**
  * Builds a successful tool result. `structured` is attached as
- * structuredContent only when the text was not truncated, so it never
- * bypasses CHARACTER_LIMIT.
+ * structuredContent only when it fits CHARACTER_LIMIT itself, so it never
+ * bypasses the limit (clients may show it instead of the Markdown text).
  */
 export function toolResult(
   format: ResponseFormat,
@@ -124,9 +124,10 @@ export function toolResult(
     structured,
     truncationHint
   );
+  const fits = !truncated && toJson(structured).length <= CHARACTER_LIMIT;
   return {
     content: [{ type: "text" as const, text }],
-    ...(truncated ? {} : { structuredContent: structured }),
+    ...(fits ? { structuredContent: structured } : {}),
   };
 }
 
