@@ -50,6 +50,9 @@ const InputSchema = z
 
 type Input = z.infer<typeof InputSchema>;
 
+/** Forward-projection series inside `performance`, e.g. "worst_pl". */
+const PROJECTION_KEY = /^(best|worst|expected)(_return|_pl)?$/;
+
 interface PerformanceResponse {
   plan_expected_return?: number;
   performance?: {
@@ -302,13 +305,14 @@ Error handling:
         // server-side filtering on this endpoint.
         let filtered = sliceByDate(raw, params.date_from, params.date_to);
 
-        // Optionally strip projection arrays to keep output compact.
+        // Optionally strip projection arrays to keep output compact. The
+        // API names them best_return, worst_pl, expected_return, etc.
         if (!params.include_projections && filtered.performance) {
-          const { best, worst, expected, ...rest } = filtered.performance;
-          // intentionally drop best/worst/expected
-          void best;
-          void worst;
-          void expected;
+          const rest = Object.fromEntries(
+            Object.entries(filtered.performance).filter(
+              ([key]) => !PROJECTION_KEY.test(key)
+            )
+          );
           filtered = { ...filtered, performance: rest };
         }
 

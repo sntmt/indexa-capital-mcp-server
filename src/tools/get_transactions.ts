@@ -4,16 +4,23 @@
  * Retrieves the transaction history for an Indexa account: contributions,
  * withdrawals, fund subscriptions and redemptions, fees charged, etc.
  *
- * The endpoint is GET /accounts/{account_number}/transactions. The
- * exact response shape is not documented in the public RAML, so we
- * present it permissively: we know the response is an array of
- * transaction objects with at least a date and amount.
+ * Indexa splits the history across two endpoints:
+ *   - GET /accounts/{account_number}/cash-transactions       (money in/out)
+ *   - GET /accounts/{account_number}/instrument-transactions (fund buys/sells)
+ * Both are fetched in parallel and merged. The exact response shapes are
+ * not documented in the public RAML, so we read them permissively and
+ * tag each transaction with the endpoint it came from.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { AxiosError } from "axios";
 import { z } from "zod";
 import { apiGet, handleApiError } from "../services/client.js";
-import { formatEur, renderOutput } from "../services/format.js";
+import {
+  formatEur,
+  maskIdsInText,
+  renderOutput,
+} from "../services/format.js";
 import {
   accountNumberSchema,
   isoDateSchema,
@@ -44,25 +51,110 @@ const InputSchema = z
 
 type Input = z.infer<typeof InputSchema>;
 
+type TransactionSource = "cash" | "instrument";
+
+const SOURCE_PATHS: Record<TransactionSource, string> = {
+  cash: "/cash-transactions",
+  instrument: "/instrument-transactions",
+};
+
 interface Transaction {
   date?: string;
-  amount?: number;
+  operation_date?: string;
+  value_date?: string;
+  amount?: number | string;
   type?: string;
+  operation_type?: string;
   description?: string;
+  comments?: string;
   instrument?: { name?: string; identifier?: string };
   [key: string]: unknown;
 }
 
-type TransactionsResponse = Transaction[] | { transactions?: Transaction[] };
+type TransactionsResponse =
+  | Transaction[]
+  | { transactions?: Transaction[]; data?: Transaction[] };
 
 function extractTransactions(
   raw: TransactionsResponse
 ): Transaction[] {
   if (Array.isArray(raw)) return raw;
-  if (raw && typeof raw === "object" && Array.isArray(raw.transactions)) {
-    return raw.transactions;
+  if (raw && typeof raw === "object") {
+    if (Array.isArray(raw.transactions)) return raw.transactions;
+    if (Array.isArray(raw.data)) return raw.data;
   }
   return [];
+}
+
+/**
+ * Compact view of a transaction. The raw API objects embed the full
+ * fund description, order and PDF metadata (~2 KB each), which blows
+ * past the response limit for any account with a few months of history.
+ */
+interface TransactionSummary {
+  source: TransactionSource;
+  date?: string;
+  value_date?: string;
+  type?: string;
+  amount?: number;
+  description?: string;
+  instrument?: { name?: string; identifier?: string };
+  titles?: number;
+  price?: number;
+  reference?: string;
+}
+
+function toDate(value: unknown): string | undefined {
+  return typeof value === "string" ? value.slice(0, 10) : undefined;
+}
+
+function toNumber(value: unknown): number | undefined {
+  const n = typeof value === "string" ? Number(value) : value;
+  return typeof n === "number" && !Number.isNaN(n) ? n : undefined;
+}
+
+function summarize(
+  tx: Transaction,
+  source: TransactionSource
+): TransactionSummary {
+  const text = tx.description ?? tx.comments;
+  return {
+    source,
+    date: toDate(tx.date ?? tx.operation_date ?? tx.value_date),
+    value_date: toDate(tx.value_date),
+    type: tx.operation_type ?? tx.type,
+    amount: toNumber(tx.amount),
+    // Transfer concepts can carry the holder's full DNI/NIE.
+    description: typeof text === "string" ? maskIdsInText(text) : undefined,
+    instrument: tx.instrument
+      ? { name: tx.instrument.name, identifier: tx.instrument.identifier }
+      : undefined,
+    titles: toNumber(tx.titles),
+    price: toNumber(tx.price),
+    reference: typeof tx.reference === "string" ? tx.reference : undefined,
+  };
+}
+
+/**
+ * Fetches one transaction endpoint. A 404 means the endpoint does not
+ * apply to this account type, so it yields an empty list instead of
+ * failing the whole call.
+ */
+async function fetchSource(
+  accountNumber: string,
+  source: TransactionSource
+): Promise<TransactionSummary[]> {
+  try {
+    const raw = await apiGet<TransactionsResponse>(
+      `/accounts/${encodeURIComponent(accountNumber)}${SOURCE_PATHS[source]}`
+    );
+    return extractTransactions(raw).map((tx) => summarize(tx, source));
+  } catch (error) {
+    if (error instanceof AxiosError && error.response?.status === 404) {
+      return [];
+    }
+    throw error;
+  }
 }
 
 function inDateWindow(
@@ -78,7 +170,7 @@ function inDateWindow(
 }
 
 function renderMarkdown(
-  txs: Transaction[],
+  txs: TransactionSummary[],
   total: number,
   offset: number
 ): string {
@@ -94,17 +186,18 @@ function renderMarkdown(
     return lines.join("\n");
   }
 
-  lines.push("| Fecha | Tipo | Importe | Concepto |");
-  lines.push("|---|---|---:|---|");
+  lines.push("| Fecha | Origen | Tipo | Importe | Concepto |");
+  lines.push("|---|---|---|---:|---|");
   for (const tx of txs) {
-    const date = tx.date?.slice(0, 10) ?? "—";
+    const date = tx.date ?? "—";
+    const origin = tx.source === "cash" ? "Efectivo" : "Fondos";
     const type = tx.type ?? "—";
     const amt = formatEur(tx.amount);
     const desc =
       tx.description ??
       tx.instrument?.name ??
       (tx.instrument?.identifier ? `ISIN ${tx.instrument.identifier}` : "—");
-    lines.push(`| ${date} | ${type} | ${amt} | ${desc} |`);
+    lines.push(`| ${date} | ${origin} | ${type} | ${amt} | ${desc} |`);
   }
 
   return lines.join("\n");
@@ -128,18 +221,28 @@ Args:
   - response_format ('markdown' | 'json'): Output format (default: 'markdown')
 
 Returns:
-  For JSON format, an array of transaction objects. The exact shape is not
-  fully published in the Indexa RAML, but transactions typically include:
+  For JSON format, a compact array of transactions merged from the
+  cash-transactions and instrument-transactions endpoints, newest first:
   {
+    "source": "cash" | "instrument",     // endpoint the entry came from
     "date": "YYYY-MM-DD",
-    "amount": number,                    // EUR; positive = into account
-    "type": string,                      // e.g. "contribution", "subscription", "redemption", "fee"
-    "description": string,
+    "value_date"?: "YYYY-MM-DD",
+    "type": string,                      // Indexa operation type, e.g. "TRANSFERENCIA SEPA",
+                                         // "SUSCRIPCIÓN FONDOS INVERSIÓN", "COMISIONES CUSTODIA"
+    "amount": number,                    // EUR; cash entries are signed (negative = out of account)
+    "description"?: string,              // concept, with DNI/NIE masked
     "instrument"?: {
       "name": string,
-      "identifier": string                // ISIN
-    }
+      "identifier": string                // ISIN, or DGS code for pension funds
+    },
+    "titles"?: number,                   // units bought/sold (instrument entries)
+    "price"?: number,
+    "reference"?: string
   }
+
+  Each fund purchase appears twice: once as the cash debit
+  ("OPERACIONES VALORES", source "cash") and once as the subscription
+  (source "instrument"). Don't add both when totalling.
 
 Examples:
   - Use when: "How much have I contributed to Indexa this year?"
@@ -163,10 +266,14 @@ the date_from / date_to window to keep responses fast and within limits.`,
     },
     async (params: Input) => {
       try {
-        const raw = await apiGet<TransactionsResponse>(
-          `/accounts/${encodeURIComponent(params.account_number)}/transactions`
+        const [cash, instrument] = await Promise.all([
+          fetchSource(params.account_number, "cash"),
+          fetchSource(params.account_number, "instrument"),
+        ]);
+        // Newest first; undated entries sink to the end.
+        const all = [...cash, ...instrument].sort((a, b) =>
+          (b.date ?? "").localeCompare(a.date ?? "")
         );
-        const all = extractTransactions(raw);
 
         const filtered = all.filter((tx) =>
           inDateWindow(tx.date, params.date_from, params.date_to)
