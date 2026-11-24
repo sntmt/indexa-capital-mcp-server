@@ -59,6 +59,14 @@ export function maskSensitive(value: string | undefined): string | undefined {
 }
 
 /**
+ * Masks Spanish DNI/NIE numbers embedded in free text, such as the
+ * concept of a bank transfer ("APELLIDOS NOMBRE-12345678Z").
+ */
+export function maskIdsInText(text: string): string {
+  return text.replace(/\b[XYZ]?\d{7,8}[A-Z]\b/gi, (id) => `***${id.slice(-3)}`);
+}
+
+/**
  * Truncates an output string at CHARACTER_LIMIT, appending an explanatory
  * note. Used as a final guard for tools whose responses may be large
  * (performance series, transactions, etc.).
